@@ -30,6 +30,7 @@ helmImage: alpine/helm:3
 service:
   type: ClusterIP
   port: 3000
+  # nodePort: 30300  # pin a specific NodePort (only used when type=NodePort)
 
 ingress:
   enabled: false
