@@ -183,6 +183,37 @@ impl HelmMcpServer {
     }
 
     #[tool(
+        name = "install_helm_chartPlan",
+        description = "Describe what install_helm_chart will do without executing it. \
+        Call this before install_helm_chart to show the user a summary of the planned action for confirmation."
+    )]
+    async fn install_helm_chart_plan(
+        &self,
+        Parameters(input): Parameters<InstallChartInput>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let version_str = input.version.as_deref().unwrap_or("latest");
+        let repo_str = input.repo.as_deref().unwrap_or("(bundled with chart name)");
+        let values_str = if input.values.is_some() { "custom values provided" } else { "none (chart defaults)" };
+        Ok(format!(
+            "Planned Helm install/upgrade:\n\n\
+             \x20 Release:    {}\n\
+             \x20 Chart:      {} (version: {})\n\
+             \x20 Cluster:    {}\n\
+             \x20 Namespace:  {}\n\
+             \x20 Repository: {}\n\
+             \x20 Values:     {}\n\n\
+             This will run: helm upgrade --install {} {} --namespace {} ...",
+            input.release_name,
+            input.chart, version_str,
+            input.cluster,
+            input.namespace,
+            repo_str,
+            values_str,
+            input.release_name, input.chart, input.namespace,
+        ))
+    }
+
+    #[tool(
         description = "Roll back a Helm release to a previous revision on a Rancher-managed cluster. \
         Spawns a Kubernetes Job that runs helm rollback. Returns the Job name immediately; \
         use get_job_status to check progress and retrieve logs."
@@ -224,6 +255,35 @@ impl HelmMcpServer {
              Namespace: {}\n\n\
              Use get_job_status(job_name=\"{job_name}\") to check progress and retrieve logs.",
             self.k8s.namespace()
+        ))
+    }
+
+    #[tool(
+        name = "rollback_helm_releasePlan",
+        description = "Describe what rollback_helm_release will do without executing it. \
+        Call this before rollback_helm_release to show the user a summary of the planned rollback for confirmation."
+    )]
+    async fn rollback_helm_release_plan(
+        &self,
+        Parameters(input): Parameters<RollbackChartInput>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let revision_str = input.revision
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "previous (default)".to_string());
+        Ok(format!(
+            "Planned Helm rollback:\n\n\
+             \x20 Release:   {}\n\
+             \x20 Cluster:   {}\n\
+             \x20 Namespace: {}\n\
+             \x20 Revision:  {}\n\n\
+             This will run: helm rollback {} {} --namespace {} ...",
+            input.release_name,
+            input.cluster,
+            input.namespace,
+            revision_str,
+            input.release_name,
+            input.revision.map(|r| r.to_string()).unwrap_or_default(),
+            input.namespace,
         ))
     }
 
