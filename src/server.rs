@@ -191,26 +191,28 @@ impl HelmMcpServer {
         &self,
         Parameters(input): Parameters<InstallChartInput>,
     ) -> Result<String, rmcp::ErrorData> {
-        let version_str = input.version.as_deref().unwrap_or("latest");
-        let repo_str = input.repo.as_deref().unwrap_or("(bundled with chart name)");
-        let values_str = if input.values.is_some() { "custom values provided" } else { "none (chart defaults)" };
-        Ok(format!(
-            "Planned Helm install/upgrade:\n\n\
-             \x20 Release:    {}\n\
-             \x20 Chart:      {} (version: {})\n\
-             \x20 Cluster:    {}\n\
-             \x20 Namespace:  {}\n\
-             \x20 Repository: {}\n\
-             \x20 Values:     {}\n\n\
-             This will run: helm upgrade --install {} {} --namespace {} ...",
-            input.release_name,
-            input.chart, version_str,
-            input.cluster,
-            input.namespace,
-            repo_str,
-            values_str,
-            input.release_name, input.chart, input.namespace,
-        ))
+        let mut payload = serde_json::json!({
+            "chart": input.chart,
+            "version": input.version.as_deref().unwrap_or("latest"),
+        });
+        if let Some(repo) = &input.repo {
+            payload["repo"] = serde_json::Value::String(repo.clone());
+        }
+        if let Some(values) = &input.values {
+            payload["values"] = values.clone();
+        }
+        let plan = serde_json::json!([{
+            "type": "create",
+            "resource": {
+                "kind": "HelmRelease",
+                "name": input.release_name,
+                "namespace": input.namespace,
+                "cluster": input.cluster,
+            },
+            "payload": payload,
+        }]);
+        serde_json::to_string(&plan)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     }
 
     #[tool(
@@ -267,24 +269,24 @@ impl HelmMcpServer {
         &self,
         Parameters(input): Parameters<RollbackChartInput>,
     ) -> Result<String, rmcp::ErrorData> {
-        let revision_str = input.revision
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "previous (default)".to_string());
-        Ok(format!(
-            "Planned Helm rollback:\n\n\
-             \x20 Release:   {}\n\
-             \x20 Cluster:   {}\n\
-             \x20 Namespace: {}\n\
-             \x20 Revision:  {}\n\n\
-             This will run: helm rollback {} {} --namespace {} ...",
-            input.release_name,
-            input.cluster,
-            input.namespace,
-            revision_str,
-            input.release_name,
-            input.revision.map(|r| r.to_string()).unwrap_or_default(),
-            input.namespace,
-        ))
+        let target = input.revision
+            .map(|r| serde_json::Value::Number(r.into()))
+            .unwrap_or(serde_json::Value::String("previous".to_string()));
+        let plan = serde_json::json!([{
+            "type": "update",
+            "resource": {
+                "kind": "HelmRelease",
+                "name": input.release_name,
+                "namespace": input.namespace,
+                "cluster": input.cluster,
+            },
+            "payload": {
+                "original": { "revision": "current" },
+                "patched": { "revision": target },
+            },
+        }]);
+        serde_json::to_string(&plan)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     }
 
     #[tool(
