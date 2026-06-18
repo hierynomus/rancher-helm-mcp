@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "rancher-helm-mcp.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rancher-helm-mcp.labels" . | nindent 4 }}
+rules:
+  # Create and inspect helm install/list Jobs.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+
+  # List the Pods belonging to a Job (needed to find the Pod name for log retrieval).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+
+  # Fetch helm output from the Job's Pod logs.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+  # Create per-Job Secrets that carry the target-cluster kubeconfig and values.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]

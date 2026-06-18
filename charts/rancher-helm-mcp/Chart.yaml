@@ -1,0 +1,12 @@
+apiVersion: v2
+name: rancher-helm-mcp
+description: MCP server that installs Helm charts on Rancher-managed clusters via Kubernetes Jobs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mcp
+  - helm
+  - rancher
+maintainers:
+  - name: SUSE
