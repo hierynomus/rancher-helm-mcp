@@ -57,8 +57,20 @@ pub struct InstallChartInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RollbackChartInput {
+    #[schemars(description = "Rancher cluster ID (e.g. c-m-abcd1234) or cluster name")]
+    pub cluster: String,
+    #[schemars(description = "Kubernetes namespace the release lives in")]
+    pub namespace: String,
+    #[schemars(description = "Helm release name to roll back")]
+    pub release_name: String,
+    #[schemars(description = "Revision to roll back to; omit to roll back to the previous release")]
+    pub revision: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetJobStatusInput {
-    #[schemars(description = "Job name returned by install_helm_chart")]
+    #[schemars(description = "Job name returned by install_helm_chart or rollback_helm_release")]
     pub job_name: String,
 }
 
@@ -171,7 +183,52 @@ impl HelmMcpServer {
     }
 
     #[tool(
-        description = "Check the status of a helm Job created by install_helm_chart. \
+        description = "Roll back a Helm release to a previous revision on a Rancher-managed cluster. \
+        Spawns a Kubernetes Job that runs helm rollback. Returns the Job name immediately; \
+        use get_job_status to check progress and retrieve logs."
+    )]
+    async fn rollback_helm_release(
+        &self,
+        Parameters(input): Parameters<RollbackChartInput>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
+        info!(cluster_id, release = %input.release_name, "Fetching kubeconfig for rollback");
+
+        let kubeconfig = self
+            .rancher
+            .generate_kubeconfig(&cluster_id)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let mut helm_args = vec![
+            "rollback".to_string(),
+            input.release_name.clone(),
+        ];
+        if let Some(rev) = input.revision {
+            helm_args.push(rev.to_string());
+        }
+        helm_args.extend([
+            "--namespace".to_string(),
+            input.namespace.clone(),
+        ]);
+
+        let job_name = self
+            .k8s
+            .spawn_helm_job("rollback", &input.release_name, helm_args, &kubeconfig, None)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(format!(
+            "Helm rollback job created.\n\
+             Job:       {job_name}\n\
+             Namespace: {}\n\n\
+             Use get_job_status(job_name=\"{job_name}\") to check progress and retrieve logs.",
+            self.k8s.namespace()
+        ))
+    }
+
+    #[tool(
+        description = "Check the status of a helm Job created by install_helm_chart or rollback_helm_release. \
         Returns the phase (Pending / Running / Succeeded / Failed) and, once the Job \
         has finished, the helm output from its logs."
     )]
@@ -565,6 +622,62 @@ mod tests {
         let json_str = guard[0].values_json.as_ref().expect("values_json should be Some");
         let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(v["replicas"], 3);
+    }
+
+    // ── rollback_helm_release ──────────────────────────────────────────────
+
+    fn rollback_input(release: &str) -> RollbackChartInput {
+        RollbackChartInput {
+            cluster: "local".to_string(),
+            namespace: "default".to_string(),
+            release_name: release.to_string(),
+            revision: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_returns_job_name_in_output() {
+        let server = make_server(StubRancher::empty(), RecordingJobRunner::new());
+        let out = server
+            .rollback_helm_release(Parameters(rollback_input("nginx")))
+            .await
+            .unwrap();
+        assert!(out.contains("helm-install-nginx-abc12345"), "output: {out}");
+    }
+
+    #[tokio::test]
+    async fn rollback_without_revision_omits_revision_arg() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let runner = RecordingJobRunner { calls: Arc::clone(&calls), ..RecordingJobRunner::new() };
+        let server = make_server(StubRancher::empty(), runner);
+        server
+            .rollback_helm_release(Parameters(rollback_input("nginx")))
+            .await
+            .unwrap();
+
+        let guard = calls.lock().unwrap();
+        let args = &guard[0].helm_args;
+        assert_eq!(args[0], "rollback");
+        assert_eq!(args[1], "nginx");
+        // Third arg should be --namespace, not a revision number
+        assert_eq!(args[2], "--namespace");
+    }
+
+    #[tokio::test]
+    async fn rollback_with_revision_passes_revision_arg() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let runner = RecordingJobRunner { calls: Arc::clone(&calls), ..RecordingJobRunner::new() };
+        let server = make_server(StubRancher::empty(), runner);
+        let mut input = rollback_input("nginx");
+        input.revision = Some(3);
+        server.rollback_helm_release(Parameters(input)).await.unwrap();
+
+        let guard = calls.lock().unwrap();
+        let args = &guard[0].helm_args;
+        assert_eq!(args[0], "rollback");
+        assert_eq!(args[1], "nginx");
+        assert_eq!(args[2], "3");
+        assert_eq!(args[3], "--namespace");
     }
 
     // ── get_job_status ─────────────────────────────────────────────────────
