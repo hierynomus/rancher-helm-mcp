@@ -20,7 +20,7 @@ anyhow = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 http = "1"
 rustls = { version = "0.23", features = ["ring"] }
-kube = { version = "0.99", features = ["client"] }
+kube = { version = "4.0", features = ["client"] }
 k8s-openapi = { version = "0.24", features = ["v1_30"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
