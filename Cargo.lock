@@ -1381,6 +1381,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "http",
  "k8s-openapi",
  "kube",
  "reqwest",

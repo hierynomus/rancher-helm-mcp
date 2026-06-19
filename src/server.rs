@@ -1,8 +1,10 @@
 use anyhow::Result;
 use rmcp::{
     ServerHandler,
+    handler::server::tool::ToolCallContext,
     handler::server::wrapper::Parameters,
-    model::{Implementation, InitializeResult, ServerCapabilities, ServerInfo},
+    model::{CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ServerCapabilities, ServerInfo},
+    service::{RequestContext, RoleServer},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -11,23 +13,60 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::k8s::HelmJobRunner;
-use crate::rancher::RancherApi;
+use crate::rancher::{RancherApi, RancherClient};
 
 #[derive(Clone)]
 pub struct HelmMcpServer {
-    rancher: Arc<dyn RancherApi>,
+    rancher: Option<Arc<dyn RancherApi>>,
     k8s: Arc<dyn HelmJobRunner>,
+    tls_verify: bool,
 }
 
 impl HelmMcpServer {
     pub fn new(
         rancher: impl RancherApi + 'static,
         k8s: impl HelmJobRunner + 'static,
+        tls_verify: bool,
     ) -> Self {
         Self {
-            rancher: Arc::new(rancher),
+            rancher: Some(Arc::new(rancher)),
             k8s: Arc::new(k8s),
+            tls_verify,
         }
+    }
+
+    /// Created when `RANCHER_URL`/`RANCHER_TOKEN` are not set; every tool call
+    /// must then supply `R_token`/`R_url` headers.
+    pub fn new_unconfigured(k8s: impl HelmJobRunner + 'static, tls_verify: bool) -> Self {
+        Self {
+            rancher: None,
+            k8s: Arc::new(k8s),
+            tls_verify,
+        }
+    }
+
+    /// Returns the active Rancher client.
+    ///
+    /// # Panics
+    /// Panics only if called from a tool method when `rancher` is `None`,
+    /// which cannot happen because `call_tool` returns an error before
+    /// dispatching in that case.
+    fn rancher_client(&self) -> &dyn RancherApi {
+        self.rancher.as_deref().expect("rancher client not configured; call_tool should have caught this")
+    }
+
+    /// If the caller supplied `R_token` and `R_url` headers (as the Rancher AI
+    /// assistant does), build a per-request RancherClient that uses those
+    /// credentials, respecting the caller's Rancher RBAC.
+    fn request_rancher_from_headers(
+        &self,
+        cx: &RequestContext<RoleServer>,
+    ) -> Option<Arc<dyn RancherApi>> {
+        let parts = cx.extensions.get::<http::request::Parts>()?;
+        let token = parts.headers.get("R_token")?.to_str().ok()?;
+        let url = parts.headers.get("R_url")?.to_str().ok()?;
+        let client = RancherClient::new(url.to_string(), token.to_string(), self.tls_verify).ok()?;
+        Some(Arc::new(client) as Arc<dyn RancherApi>)
     }
 }
 
@@ -92,7 +131,7 @@ impl HelmMcpServer {
         Parameters(_): Parameters<ListClustersInput>,
     ) -> Result<String, rmcp::ErrorData> {
         let clusters = self
-            .rancher
+            .rancher_client()
             .list_clusters()
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -134,7 +173,7 @@ impl HelmMcpServer {
         info!(cluster_id, release = %input.release_name, chart = %input.chart, "Fetching kubeconfig");
 
         let kubeconfig = self
-            .rancher
+            .rancher_client()
             .generate_kubeconfig(&cluster_id)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -228,7 +267,7 @@ impl HelmMcpServer {
         info!(cluster_id, release = %input.release_name, "Fetching kubeconfig for rollback");
 
         let kubeconfig = self
-            .rancher
+            .rancher_client()
             .generate_kubeconfig(&cluster_id)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -322,7 +361,7 @@ impl HelmMcpServer {
     ) -> Result<String, rmcp::ErrorData> {
         let cluster_id = self.resolve_cluster_id(&input.cluster).await?;
         let kubeconfig = self
-            .rancher
+            .rancher_client()
             .generate_kubeconfig(&cluster_id)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -369,7 +408,7 @@ impl HelmMcpServer {
         }
 
         let clusters = self
-            .rancher
+            .rancher_client()
             .list_clusters()
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -399,6 +438,28 @@ impl ServerHandler for HelmMcpServer {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
             ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        cx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(scoped_rancher) = self.request_rancher_from_headers(&cx) {
+            let scoped = HelmMcpServer {
+                rancher: Some(scoped_rancher),
+                k8s: Arc::clone(&self.k8s),
+                tls_verify: self.tls_verify,
+            };
+            return HelmMcpServer::tool_router().call(ToolCallContext::new(&scoped, request, cx)).await;
+        }
+        if self.rancher.is_none() {
+            return Err(rmcp::ErrorData::invalid_request(
+                "R_token and R_url headers are required when RANCHER_URL and RANCHER_TOKEN are not configured",
+                None,
+            ));
+        }
+        HelmMcpServer::tool_router().call(ToolCallContext::new(self, request, cx)).await
     }
 }
 
@@ -525,7 +586,7 @@ mod tests {
         rancher: impl RancherApi + 'static,
         k8s: impl HelmJobRunner + 'static,
     ) -> HelmMcpServer {
-        HelmMcpServer::new(rancher, k8s)
+        HelmMcpServer::new(rancher, k8s, false)
     }
 
     // ── resolve_cluster_id ─────────────────────────────────────────────────
@@ -813,6 +874,166 @@ mod tests {
             "args: {:?}",
             guard[0].helm_args
         );
+    }
+
+    // ── HTTP integration tests (header-based credential routing) ──────────────
+    //
+    // call_tool's `request_rancher_from_headers` logic requires HTTP request
+    // parts in cx.extensions, which only StreamableHttpService injects.
+    // These tests spin up the real service and fire raw JSON-RPC over HTTP.
+
+    use axum::Router;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+
+    async fn start_helm_mcp_http(server: HelmMcpServer) -> String {
+        let svc = StreamableHttpService::new(
+            move || Ok(server.clone()),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default().disable_allowed_hosts(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback_service(svc)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn mcp_initialize(client: &reqwest::Client, url: &str) -> String {
+        let resp = client.post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" }
+                }
+            }))
+            .send().await.unwrap();
+        let sid = resp.headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+            .expect("no session ID in initialize response")
+            .to_string();
+        client.post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", &sid)
+            .json(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+            .send().await.unwrap();
+        sid
+    }
+
+    async fn call_list_clusters(
+        client: &reqwest::Client,
+        url: &str,
+        sid: &str,
+        r_token: Option<&str>,
+        r_url: Option<&str>,
+    ) -> serde_json::Value {
+        let mut req = client.post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", sid)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "list_clusters", "arguments": {} }
+            }));
+        if let Some(t) = r_token { req = req.header("R_token", t); }
+        if let Some(u) = r_url  { req = req.header("R_url", u); }
+        let resp = req.send().await.unwrap();
+        let ct = resp.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let text = resp.text().await.unwrap();
+        if ct.starts_with("text/event-stream") {
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        return v;
+                    }
+                }
+            }
+            panic!("no JSON in SSE body: {text}");
+        } else {
+            serde_json::from_str(&text).unwrap_or_else(|_| panic!("parse error: {text}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfigured_server_requires_auth_headers() {
+        let server = HelmMcpServer::new_unconfigured(RecordingJobRunner::new(), false);
+        let url = start_helm_mcp_http(server).await;
+        let client = reqwest::Client::new();
+        let sid = mcp_initialize(&client, &url).await;
+
+        let body = call_list_clusters(&client, &url, &sid, None, None).await;
+
+        // call_tool returns ErrorData::invalid_request → JSON-RPC error
+        let msg = body["error"]["message"].as_str().unwrap_or_else(|| panic!("expected error, got: {body}"));
+        assert!(
+            msg.contains("R_token") || msg.contains("R_url"),
+            "expected auth error, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn r_token_headers_route_to_per_request_rancher() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+
+        let rancher = MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/v3/clusters"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "c-perreq", "name": "per-request-cluster", "state": "active"}]
+            })))
+            .mount(&rancher).await;
+
+        let server = HelmMcpServer::new_unconfigured(RecordingJobRunner::new(), false);
+        let url = start_helm_mcp_http(server).await;
+        let client = reqwest::Client::new();
+        let sid = mcp_initialize(&client, &url).await;
+
+        let body = call_list_clusters(&client, &url, &sid, Some("any-token"), Some(&rancher.uri())).await;
+
+        let text = body["result"]["content"][0]["text"].as_str()
+            .unwrap_or_else(|| panic!("unexpected response: {body}"));
+        assert!(text.contains("per-request-cluster"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn r_token_headers_override_static_credentials() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+
+        let per_request_rancher = MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/v3/clusters"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "c-perreq", "name": "per-request-cluster", "state": "active"}]
+            })))
+            .mount(&per_request_rancher).await;
+
+        let static_rancher = StubRancher::with_clusters(vec![cluster("c-static", "static-cluster")]);
+        let server = HelmMcpServer::new(static_rancher, RecordingJobRunner::new(), false);
+        let url = start_helm_mcp_http(server).await;
+        let client = reqwest::Client::new();
+        let sid = mcp_initialize(&client, &url).await;
+
+        // Without headers → static client → "static-cluster"
+        let body = call_list_clusters(&client, &url, &sid, None, None).await;
+        let text = body["result"]["content"][0]["text"].as_str()
+            .unwrap_or_else(|| panic!("expected result: {body}"));
+        assert!(text.contains("static-cluster"), "expected static, got: {body}");
+
+        // With headers → per-request client → "per-request-cluster"
+        let body = call_list_clusters(&client, &url, &sid, Some("any-token"), Some(&per_request_rancher.uri())).await;
+        let text = body["result"]["content"][0]["text"].as_str()
+            .unwrap_or_else(|| panic!("expected result: {body}"));
+        assert!(text.contains("per-request-cluster"), "expected per-request, got: {body}");
     }
 
     #[tokio::test]

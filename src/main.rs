@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -24,10 +24,8 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let rancher_url = std::env::var("RANCHER_URL")
-        .context("RANCHER_URL environment variable is required")?;
-    let rancher_token = std::env::var("RANCHER_TOKEN")
-        .context("RANCHER_TOKEN environment variable is required")?;
+    let rancher_url = std::env::var("RANCHER_URL").ok();
+    let rancher_token = std::env::var("RANCHER_TOKEN").ok();
     let tls_verify = std::env::var("RANCHER_TLS_VERIFY")
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
@@ -45,11 +43,20 @@ async fn main() -> Result<()> {
     let helm_image = std::env::var("HELM_IMAGE")
         .unwrap_or_else(|_| "alpine/helm:3".to_string());
 
-    info!(%rancher_url, tls_verify, %job_namespace, %helm_image, "Starting rancher-helm-mcp");
-
-    let rancher = RancherClient::new(rancher_url, rancher_token, tls_verify)?;
+    info!(tls_verify, %job_namespace, %helm_image, "Starting rancher-helm-mcp");
     let k8s = K8sJobRunner::try_new(job_namespace, helm_image).await?;
-    let server = HelmMcpServer::new(rancher, k8s);
+
+    let server = match (rancher_url, rancher_token) {
+        (Some(url), Some(token)) => {
+            info!(%url, "Using static Rancher credentials from environment");
+            let rancher = RancherClient::new(url, token, tls_verify)?;
+            HelmMcpServer::new(rancher, k8s, tls_verify)
+        }
+        _ => {
+            info!("No static Rancher credentials; R_token and R_url headers required per request");
+            HelmMcpServer::new_unconfigured(k8s, tls_verify)
+        }
+    };
 
     match std::env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
         Some(port) => serve_http(server, port).await,
