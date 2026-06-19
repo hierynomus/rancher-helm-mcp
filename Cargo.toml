@@ -21,7 +21,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 http = "1"
 rustls = { version = "0.23", features = ["ring"] }
 kube = { version = "0.99", features = ["client"] }
-k8s-openapi = { version = "0.24", features = ["v1_30"] }
+k8s-openapi = { version = "0.26", features = ["v1_30"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 
